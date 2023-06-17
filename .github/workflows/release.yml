@@ -1,0 +1,181 @@
+name: release
+on:
+  push:
+    tags:
+      # this is a glob, not a regexp
+      - '[0-9]*'
+
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/cockpit-project/unit-tests
+      options: --user root
+    permissions:
+      # create GitHub release
+      contents: write
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # https://github.blog/2022-04-12-git-security-vulnerability-announced/
+      - name: Pacify git's permission check
+        run: git config --global --add safe.directory /__w/cockpit/cockpit
+
+      - name: Workaround for https://github.com/actions/checkout/pull/697
+        run: git fetch --force origin $(git describe --tags):refs/tags/$(git describe --tags)
+
+      - name: Bootstrap automake
+        run: ./autogen.sh
+
+      - name: Build release
+        run: make dist -j$(nproc) VERSION='${{ github.ref_name }}'
+
+      - id: publish
+        name: Publish GitHub release
+        uses: cockpit-project/action-release@88d994da62d1451c7073e26748c18413fcdf46e9
+        with:
+          filename: "cockpit-${{ github.ref_name }}.tar.xz"
+
+    outputs:
+      filename: ${{ steps.publish.outputs.filename }}
+      checksum: ${{ steps.publish.outputs.checksum }}
+      download: ${{ steps.publish.outputs.download }}
+      body: ${{ steps.publish.outputs.body }}
+
+  guide:
+    needs: source
+    environment: website
+    permissions: {}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/cockpit-project/unit-tests
+      options: --user root
+    steps:
+      - name: Checkout website repository
+        uses: actions/checkout@v3
+        with:
+          path: website
+          repository: cockpit-project/cockpit-project.github.io
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Download source release
+        run: curl -L -o '${{ needs.source.outputs.filename }}' '${{ needs.source.outputs.download }}'
+
+      - name: Verify checksum
+        run: echo '${{ needs.source.outputs.checksum }} ${{ needs.source.outputs.filename }}' | sha256sum -c
+
+      - name: Build guide
+        run: |
+          mkdir source build
+          tar --directory source --extract --strip-components=1 --file '${{ needs.source.outputs.filename }}'
+          (
+              cd build
+              ../source/configure
+              make doc/guide/html/index.html
+          )
+
+      - name: Update the website
+        run: |
+          rm -rf website/guide/latest
+          mv -Tv build/doc/guide/html website/guide/latest
+
+          # Add frontmatter for Jekyll
+          find website/guide/latest -name '*.html' -exec sed -i '
+          1i\
+          ---\
+          layout: guide\
+          ---' '{}' ';'
+
+          git config --global user.name "GitHub Workflow"
+          git config --global user.email "cockpituous@cockpit-project.org"
+
+          cd website
+          git add guide/
+          git commit --message='Update guide to version ${{ github.ref_name }}'
+          git show --stat
+          git push origin main
+
+
+  flathub:
+    needs: source
+    environment: flathub
+    permissions: {}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Checkout source repository
+        uses: actions/checkout@v3
+        with:
+          path: src
+
+      - name: Checkout flathub repository
+        uses: actions/checkout@v3
+        with:
+          path: flathub
+          repository: flathub/org.cockpit_project.CockpitClient
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          # this is needed so we can push to a different repository
+          fetch-depth: 0
+
+      - name: Update flathub repository
+        env:
+          DOWNLOAD: ${{ needs.source.outputs.download }}
+          CHECKSUM: ${{ needs.source.outputs.checksum }}
+          TAG_BODY: ${{ needs.source.outputs.body }}
+        run: |
+          set -x
+
+          git config --global user.name "GitHub Workflow"
+          git config --global user.email "cockpituous@cockpit-project.org"
+
+          cd flathub
+          git checkout -b "${{ github.ref_name }}"
+          printf '%s\n' "${TAG_BODY}" | ../src/containers/flatpak/add-release \
+             org.cockpit_project.CockpitClient.releases.xml \
+             "${{ github.ref_name }}" \
+             "$(date +%Y-%m-%d)"
+          git add "$(../src/containers/flatpak/prepare "${DOWNLOAD}" "${CHECKSUM}")"
+          git add org.cockpit_project.CockpitClient.releases.xml
+          git commit -m "Update to version ${{ github.ref_name }}"
+          git show
+          git push git@github.com:cockpit-project/org.cockpit_project.CockpitClient HEAD
+
+
+  node-cache:
+    # doesn't depend on it, but let's make sure the build passes before we do this
+    needs: [source]
+    runs-on: ubuntu-latest
+    environment: node-cache
+    # done via deploy key, token needs no write permissions at all
+    permissions: {}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v3
+
+      - name: Set up git
+        run: |
+            git config user.name "GitHub Workflow"
+            git config user.email "cockpituous@cockpit-project.org"
+
+      - name: Tag node-cache
+        run: |
+          set -eux
+          # this is a shared repo, prefix with project name
+          TAG="${GITHUB_REPOSITORY#*/}-$(basename $GITHUB_REF)"
+          tools/node-modules checkout
+          cd node_modules
+          git tag "$TAG"
+          git remote add cache "ssh://git@github.com/${GITHUB_REPOSITORY%/*}/node-cache"
+          eval $(ssh-agent)
+          ssh-add - <<< '${{ secrets.DEPLOY_KEY }}'
+          # make this idempotent: delete an existing tag
+          git push cache :"$TAG" || true
+          git push cache tag "$TAG"
+          ssh-add -D
